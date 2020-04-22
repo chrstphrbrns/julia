@@ -242,6 +242,7 @@ public:
   void checkPostStmt(const ArraySubscriptExpr *CE, CheckerContext &C) const;
   void checkPostStmt(const MemberExpr *ME, CheckerContext &C) const;
   void checkPostStmt(const UnaryOperator *UO, CheckerContext &C) const;
+  void checkPostStmt(const AtomicExpr *AE, CheckerContext &C) const;
   void checkDerivingExpr(const Expr *Result, const Expr *Parent,
                          bool ParentIsLoc, CheckerContext &C) const;
   void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &) const;
@@ -398,7 +399,6 @@ PDP GCChecker::GCValueBugVisitor::ExplainNoPropagationFromExpr(
     PathDiagnosticLocation Pos, BugReporterContext &BRC, BugReport &BR) {
   const MemRegion *Region =
       N->getState()->getSVal(FromWhere, N->getLocationContext()).getAsRegion();
-  SValExplainer Ex(BRC.getASTContext());
   SymbolRef Parent = walkToRoot(
       [&](SymbolRef Sym, const ValueState *OldVState) { return !OldVState; },
       N->getState(), Region);
@@ -611,7 +611,6 @@ bool GCChecker::propagateArgumentRootedness(CheckerContext &C,
 
   bool Change = false;
   int idx = 0;
-  SValExplainer Ex(C.getASTContext());
   for (const auto P : FD->parameters()) {
     if (!isGCTrackedType(P->getType())) {
       continue;
@@ -681,7 +680,6 @@ void GCChecker::checkBeginFunction(CheckerContext &C) const {
       C.addTransition(State);
     return;
   }
-  SValExplainer Ex(C.getASTContext());
   for (const auto P : FD->parameters()) {
     if (declHasAnnotation(P, "julia_require_rooted_slot")) {
       auto Param = State->getLValue(P, LCtx);
@@ -847,7 +845,6 @@ bool GCChecker::processPotentialSafepoint(const CallEvent &Call,
   if (!isSafepoint(Call))
     return false;
   bool DidChange = false;
-  SValExplainer Ex(C.getASTContext());
   if (!gcEnabledHere(C))
     return false;
   const Decl *D = Call.getDecl();
@@ -897,7 +894,6 @@ GCChecker::getValStateForRegion(ASTContext &AstC, const ProgramStateRef &State,
                                 const MemRegion *Region, bool Debug) {
   if (!Region)
     return nullptr;
-  SValExplainer Ex(AstC);
   SymbolRef Sym = walkToRoot(
       [&](SymbolRef Sym, const ValueState *OldVState) {
         return !OldVState || !OldVState->isRooted();
@@ -916,17 +912,26 @@ bool GCChecker::processArgumentRooting(const CallEvent &Call, CheckerContext &C,
     return false;
   const MemRegion *RootingRegion = nullptr;
   SymbolRef RootedSymbol = nullptr;
-  for (unsigned i = 0; i < FD->getNumParams(); ++i) {
-    if (declHasAnnotation(FD->getParamDecl(i), "julia_rooting_argument")) {
-      RootingRegion = Call.getArgSVal(i).getAsRegion();
-    } else if (declHasAnnotation(FD->getParamDecl(i),
-                                 "julia_rooted_argument")) {
-      RootedSymbol = Call.getArgSVal(i).getAsSymbol();
+  StringRef FDName = FD->getDeclName().isIdentifier() ? FD->getName() : "";
+  if (FDName.startswith("__sync_val_compare_and_swap_") ||
+      FDName.startswith("__sync_bool_compare_and_swap_")) {
+    RootingRegion = Call.getArgSVal(0).getAsRegion();
+    RootedSymbol = Call.getArgSVal(2).getAsSymbol();
+  } else if (FDName.startswith("__sync_swap_")) {
+    RootingRegion = Call.getArgSVal(0).getAsRegion();
+    RootedSymbol = Call.getArgSVal(1).getAsSymbol();
+  } else {
+    for (unsigned i = 0; i < FD->getNumParams(); ++i) {
+      if (declHasAnnotation(FD->getParamDecl(i), "julia_rooting_argument")) {
+        RootingRegion = Call.getArgSVal(i).getAsRegion();
+      } else if (declHasAnnotation(FD->getParamDecl(i),
+                                   "julia_rooted_argument")) {
+        RootedSymbol = Call.getArgSVal(i).getAsSymbol();
+      }
     }
   }
   if (!RootingRegion || !RootedSymbol)
     return false;
-  SValExplainer Ex(C.getASTContext());
   const ValueState *OldVState =
       getValStateForRegion(C.getASTContext(), State, RootingRegion);
   if (!OldVState)
@@ -945,7 +950,6 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call,
     return false;
   }
   SymbolRef Sym = Call.getReturnValue().getAsSymbol();
-  SValExplainer Ex(C.getASTContext());
   if (!Sym) {
     SVal S = C.getSValBuilder().conjureSymbolVal(
         Call.getOriginExpr(), C.getLocationContext(), QT, C.blockCount());
@@ -1048,7 +1052,6 @@ SymbolRef GCChecker::getSymbolForResult(const Expr *Result,
     return nullptr;
   }
   SVal Loaded = State->getSVal(*ValLoc);
-  SValExplainer Ex(C.getASTContext());
   if (Loaded.isUnknown()) {
     QualType QT = Result->getType();
     if (!QT->isPointerType())
@@ -1067,6 +1070,14 @@ SymbolRef GCChecker::getSymbolForResult(const Expr *Result,
 
 void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent,
                                   bool ParentIsLoc, CheckerContext &C) const {
+  if (auto PE = dyn_cast<ParenExpr>(Parent)) {
+    Parent = PE->getSubExpr();
+  }
+  if (auto UO = dyn_cast<UnaryOperator>(Parent)) {
+    if (UO->getOpcode() == UO_AddrOf) {
+      Parent = UO->getSubExpr();
+    }
+  }
   bool ResultTracked = true;
   ProgramStateRef State = C.getState();
   if (isGloballyRootedType(Result->getType())) {
@@ -1097,7 +1108,6 @@ void GCChecker::checkDerivingExpr(const Expr *Result, const Expr *Parent,
     }
   }
   // This is the pointer
-  SValExplainer Ex(C.getASTContext());
   auto ValLoc = C.getSVal(Result).getAs<Loc>();
   if (!ValLoc) {
     return;
@@ -1166,7 +1176,6 @@ void GCChecker::checkPostStmt(const ArraySubscriptExpr *ASE,
   // by that array.
   const MemRegion *Region = C.getSVal(ASE->getLHS()).getAsRegion();
   ProgramStateRef State = C.getState();
-  SValExplainer Ex(C.getASTContext());
   if (Region && Region->getAs<ElementRegion>() &&
       isGCTrackedType(ASE->getType())) {
     const RootState *RS =
@@ -1219,6 +1228,56 @@ void GCChecker::checkPostStmt(const UnaryOperator *UO,
   }
 }
 
+void GCChecker::checkPostStmt(const AtomicExpr *AE, CheckerContext &C) const {
+  QualType QT = AE->getValueType();
+  if (!isGCTrackedType(QT))
+    return;
+
+  ProgramStateRef State = C.getState();
+  SVal Val = C.getSVal(AE);
+  SymbolRef Sym = Val.getAsSymbol(true);
+  if (!Sym) {
+    SVal S = C.getSValBuilder().conjureSymbolVal(AE, C.getLocationContext(), QT,
+                                                 C.blockCount());
+    State = State->BindExpr(AE, C.getLocationContext(), S);
+    Sym = S.getAsSymbol();
+  }
+
+  ValueState NewVState = ValueState::getAllocated();
+  switch (AE->getOp()) {
+  case AtomicExpr::AO__c11_atomic_load:
+  // case AtomicExpr::AO__atomic_load:
+  case AtomicExpr::AO__atomic_load_n: {
+    Expr *Ptr = AE->getPtr();
+    SVal Test = C.getSVal(Ptr);
+    // Walk backwards to find the region that roots this value
+    const MemRegion *Region = Test.getAsRegion();
+    const ValueState *OldVState =
+        getValStateForRegion(C.getASTContext(), State, Region);
+    if (OldVState)
+      NewVState = *OldVState;
+    State = State->set<GCValueMap>(Sym, NewVState);
+  } break;
+  case AtomicExpr::AO__c11_atomic_store:
+  // case AtomicExpr::AO__atomic_store:
+  case AtomicExpr::AO__atomic_store_n:
+    break;
+  case AtomicExpr::AO__c11_atomic_exchange:
+  // case AtomicExpr::AO__atomic_exchange:
+  case AtomicExpr::AO__atomic_exchange_n:
+    break;
+  case AtomicExpr::AO__c11_atomic_compare_exchange_strong:
+  case AtomicExpr::AO__c11_atomic_compare_exchange_weak:
+  // case AtomicExpr::AO__atomic_compare_exchange:
+  case AtomicExpr::AO__atomic_compare_exchange_n:
+    break;
+  default:
+    break;
+  }
+  // if (AE->isRValue())
+  //  checkDerivingExpr(AE, AE, true, C);
+}
+
 USED_FUNC void GCChecker::dumpState(const ProgramStateRef &State) {
   GCValueMapTy AMap = State->get<GCValueMap>();
   llvm::raw_ostream &Out = llvm::outs();
@@ -1247,7 +1306,6 @@ void GCChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
       return;
     }
   }
-  SValExplainer Ex(C.getASTContext());
   if (FD && FD->getDeclName().isIdentifier() &&
       FD->getName() == "JL_GC_PROMISE_ROOTED")
     return;
@@ -1311,7 +1369,6 @@ bool GCChecker::evalCall(const CallExpr *CE,
 #endif
   unsigned CurrentDepth = C.getState()->get<GCDepth>();
   auto name = C.getCalleeName(CE);
-  SValExplainer Ex(C.getASTContext());
   if (name == "JL_GC_POP") {
     if (CurrentDepth == 0) {
       report_error(C, "JL_GC_POP without corresponding push");
@@ -1543,7 +1600,6 @@ bool GCChecker::rootRegionIfGlobal(const MemRegion *R, ProgramStateRef &State,
                                    CheckerContext &C, ValueState *ValS) const {
   if (!R)
     return false;
-  SValExplainer Ex(C.getASTContext());
   const VarRegion *VR = R->getAs<VarRegion>();
   if (!VR)
     return false;
